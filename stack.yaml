@@ -1,6 +1,8 @@
 resolver: lts-12.11
 packages:
 - '.'
-extra-deps: []
+extra-deps:
+  - ref-tf-0.4.0.1@sha256:fe808d143a0bf19437b5ba65c74bcb5cda709944b52e13c16528864a5d897f03
+  - ieee-0.7@sha256:4f444419a7861f04fb64502d14688c80e8293a86a608f6d14c3010c9bd96b6d1
 flags: {}
 extra-package-dbs: []

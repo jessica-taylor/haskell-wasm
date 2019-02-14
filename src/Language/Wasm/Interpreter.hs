@@ -1,6 +1,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Language.Wasm.Interpreter (
     Value(..),
@@ -26,11 +27,13 @@ import qualified Data.Text.Lazy as TL
 import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (fromMaybe, isNothing)
 
+import Control.Monad.Primitive (PrimMonad, PrimState)
+import Control.Monad.Ref (MonadRef, Ref, newRef, readRef, writeRef)
+import Control.Monad.Trans (lift)
 import Data.Vector (Vector, (!), (!?), (//))
-import Data.Vector.Storable.Mutable (IOVector)
+import Data.Vector.Storable.Mutable (MVector)
 import qualified Data.Vector as Vector
-import qualified Data.Vector.Storable.Mutable as IOVector
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import qualified Data.Vector.Storable.Mutable as MVector
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Numeric.Natural (Natural)
@@ -51,7 +54,6 @@ import Data.Bits (
     )
 import Numeric.IEEE (IEEE, copySign, minNum, maxNum, identicalIEEE)
 import Control.Monad.Except (ExceptT, runExceptT, throwError)
-import Control.Monad.IO.Class (liftIO)
 
 import Language.Wasm.Structure as Struct
 import Language.Wasm.Validate as Valid
@@ -164,15 +166,15 @@ data TableInstance = TableInstance {
     elements :: Vector (Maybe Address)
 }
 
-data MemoryInstance = MemoryInstance {
+data MemoryInstance m = MemoryInstance {
     lim :: Limit,
-    memory :: IORef (IOVector Word8)
+    memory :: Ref m (MVector (PrimState m) Word8)
 }
 
-data GlobalInstance = GIConst ValueType Value | GIMut ValueType (IORef Value)
+data GlobalInstance m = GIConst ValueType Value | GIMut ValueType (Ref m Value)
 
-makeMutGlobal :: Value -> IO GlobalInstance
-makeMutGlobal val = GIMut (getValueType val) <$> newIORef val
+makeMutGlobal :: MonadRef m => Value -> m (GlobalInstance m)
+makeMutGlobal val = GIMut (getValueType val) <$> newRef val
 
 getValueType :: Value -> ValueType
 getValueType (VI32 _) = I32
@@ -189,7 +191,7 @@ data ExternalValue =
     | ExternGlobal Address
     deriving (Eq, Show)
 
-data FunctionInstance =
+data FunctionInstance m =
     FunctionInstance {
         funcType :: FuncType,
         moduleInstance :: ModuleInstance,
@@ -197,17 +199,17 @@ data FunctionInstance =
     }
     | HostInstance {
         funcType :: FuncType,
-        hostCode :: HostFunction
+        hostCode :: HostFunction m
     }
 
-data Store = Store {
-    funcInstances :: Vector FunctionInstance,
+data Store m = Store {
+    funcInstances :: Vector (FunctionInstance m),
     tableInstances :: Vector TableInstance,
-    memInstances :: Vector MemoryInstance,
-    globalInstances :: Vector GlobalInstance
+    memInstances :: Vector (MemoryInstance m),
+    globalInstances :: Vector (GlobalInstance m)
 }
 
-emptyStore :: Store
+emptyStore :: Store m
 emptyStore = Store {
     funcInstances = Vector.empty,
     tableInstances = Vector.empty,
@@ -215,15 +217,15 @@ emptyStore = Store {
     globalInstances = Vector.empty
 }
 
-type HostFunction = [Value] -> IO [Value]
+type HostFunction m = [Value] -> m [Value]
 
-data HostItem
-    = HostFunction FuncType HostFunction
-    | HostGlobal GlobalInstance
+data HostItem m
+    = HostFunction FuncType (HostFunction m)
+    | HostGlobal (GlobalInstance m)
     | HostMemory Limit
     | HostTable Limit
 
-makeHostModule :: Store -> [(TL.Text, HostItem)] -> IO (Store, ModuleInstance)
+makeHostModule :: forall m. (MonadRef m, PrimMonad m) => Store m -> [(TL.Text, HostItem m)] -> m (Store m, ModuleInstance)
 makeHostModule st items = do
     (st, emptyModInstance)
         |> makeHostFunctions
@@ -233,11 +235,11 @@ makeHostModule st items = do
     where
         (|>) = flip ($)
 
-        isHostFunction :: (TL.Text, HostItem) -> Bool
+        isHostFunction :: (TL.Text, HostItem m) -> Bool
         isHostFunction (_, (HostFunction _ _)) = True
         isHostFunction _ = False
 
-        makeHostFunctions :: (Store, ModuleInstance) -> (Store, ModuleInstance)
+        makeHostFunctions :: (Store m, ModuleInstance) -> (Store m, ModuleInstance)
         makeHostFunctions (st, inst) =
             let funcLen = Vector.length $ funcInstances st in
             let hostFunctions = filter isHostFunction items in
@@ -253,11 +255,11 @@ makeHostModule st items = do
             let st' = st { funcInstances = funcInstances st <> Vector.fromList instances } in
             (st', inst')
 
-        isHostGlobal :: (TL.Text, HostItem) -> Bool
+        isHostGlobal :: (TL.Text, HostItem m) -> Bool
         isHostGlobal (_, (HostGlobal _)) = True
         isHostGlobal _ = False
         
-        makeHostGlobals :: (Store, ModuleInstance) -> (Store, ModuleInstance)
+        makeHostGlobals :: (Store m, ModuleInstance) -> (Store m, ModuleInstance)
         makeHostGlobals (st, inst) =
             let globLen = Vector.length $ globalInstances st in
             let hostGlobals = filter isHostGlobal items in
@@ -271,11 +273,11 @@ makeHostModule st items = do
             let st' = st { globalInstances = globalInstances st <> Vector.fromList instances } in
             (st', inst')
 
-        isHostMem :: (TL.Text, HostItem) -> Bool
+        isHostMem :: (TL.Text, HostItem m) -> Bool
         isHostMem (_, (HostMemory _)) = True
         isHostMem _ = False
             
-        makeHostMems :: (Store, ModuleInstance) -> IO (Store, ModuleInstance)
+        makeHostMems :: (Store m, ModuleInstance) -> m (Store m, ModuleInstance)
         makeHostMems (st, inst) = do
             let memLen = Vector.length $ memInstances st
             let hostMems = filter isHostMem items
@@ -288,11 +290,11 @@ makeHostModule st items = do
             let st' = st { memInstances = memInstances st <> instances }
             return (st', inst')
 
-        isHostTable :: (TL.Text, HostItem) -> Bool
+        isHostTable :: (TL.Text, HostItem m) -> Bool
         isHostTable (_, (HostTable _)) = True
         isHostTable _ = False
             
-        makeHostTables :: (Store, ModuleInstance) -> IO (Store, ModuleInstance)
+        makeHostTables :: (Store m, ModuleInstance) -> m (Store m, ModuleInstance)
         makeHostTables (st, inst) = do
             let tableLen = Vector.length $ tableInstances st
             let hostTables = filter isHostTable items
@@ -324,7 +326,7 @@ emptyModInstance = ModuleInstance {
     exports = Vector.empty
 }
 
-calcInstance :: Store -> Imports -> Module -> Initialize ModuleInstance
+calcInstance :: forall m. MonadRef m => Store m -> Imports -> Module -> Initialize m ModuleInstance
 calcInstance (Store fs ts ms gs) imps Module {functions, types, tables, mems, globals, exports, imports} = do
     let funLen = length fs
     let tableLen = length ts
@@ -356,13 +358,13 @@ calcInstance (Store fs ts ms gs) imps Module {functions, types, tables, mems, gl
         exports = Vector.fromList $ map refExport exports
     }
     where
-        getImpIdx :: Import -> Initialize ExternalValue
+        getImpIdx :: Import -> Initialize m ExternalValue
         getImpIdx (Import m n _) =
             case Map.lookup (m, n) imps of
                 Just idx -> return idx
                 Nothing -> throwError $ "Cannot find import from module " ++ show m ++ " with name " ++ show n
 
-        checkImportType :: Import -> Initialize ExternalValue
+        checkImportType :: Import -> Initialize m ExternalValue
         checkImportType imp@(Import _ _ (ImportFunc typeIdx)) = do
             idx <- getImpIdx imp
             funcAddr <- case idx of
@@ -414,12 +416,12 @@ type Imports = Map.Map (TL.Text, TL.Text) ExternalValue
 emptyImports :: Imports
 emptyImports = Map.empty
 
-allocFunctions :: ModuleInstance -> [Function] -> Vector FunctionInstance
+allocFunctions :: ModuleInstance -> [Function] -> Vector (FunctionInstance m)
 allocFunctions inst@ModuleInstance {funcTypes} funs =
     let mkFuncInst f@Function {funcType} = FunctionInstance (funcTypes ! (fromIntegral funcType)) inst f in
     Vector.fromList $ map mkFuncInst funs
 
-getGlobalValue :: ModuleInstance -> Store -> Natural -> IO Value
+getGlobalValue :: MonadRef m => ModuleInstance -> Store m -> Natural -> m Value
 getGlobalValue inst store idx =
     let addr = case globaladdrs inst !? fromIntegral idx of
             Just a -> a
@@ -427,10 +429,10 @@ getGlobalValue inst store idx =
     in
     case globalInstances store ! addr of
         GIConst _ v -> return v
-        GIMut _ ref -> readIORef ref
+        GIMut _ ref -> readRef ref
 
 -- due the validation there can be only these instructions
-evalConstExpr :: ModuleInstance -> Store -> Expression -> IO Value
+evalConstExpr :: MonadRef m => ModuleInstance -> Store m -> Expression -> m Value
 evalConstExpr _ _ [I32Const v] = return $ VI32 v
 evalConstExpr _ _ [I64Const v] = return $ VI64 v
 evalConstExpr _ _ [F32Const v] = return $ VF32 v
@@ -438,19 +440,19 @@ evalConstExpr _ _ [F64Const v] = return $ VF64 v
 evalConstExpr inst store [GetGlobal i] = getGlobalValue inst store i
 evalConstExpr _ _ instrs = error $ "Global initializer contains unsupported instructions: " ++ show instrs
 
-allocAndInitGlobals :: ModuleInstance -> Store -> [Global] -> IO (Vector GlobalInstance)
+allocAndInitGlobals :: forall m. MonadRef m => ModuleInstance -> Store m -> [Global] -> m (Vector (GlobalInstance m))
 allocAndInitGlobals inst store globs = Vector.fromList <$> mapM allocGlob globs
     where
-        runIniter :: Expression -> IO Value
+        runIniter :: Expression -> m Value
         -- the spec says get global can ref only imported globals
         -- only they are in store for this moment
         runIniter = evalConstExpr inst store
 
-        allocGlob :: Global -> IO GlobalInstance
+        allocGlob :: Global -> m (GlobalInstance m)
         allocGlob (Global (Const vt) initer) = GIConst vt <$> runIniter initer
         allocGlob (Global (Mut vt) initer) = do
             val <- runIniter initer
-            GIMut vt <$> newIORef val
+            GIMut vt <$> newRef val
 
 allocTables :: [Table] -> Vector TableInstance
 allocTables tables = Vector.fromList $ map allocTable tables
@@ -468,21 +470,21 @@ defaultBudget = 300
 pageSize :: Int
 pageSize = 64 * 1024
 
-allocMems :: [Memory] -> IO (Vector MemoryInstance)
+allocMems :: forall m. (MonadRef m, PrimMonad m) => [Memory] -> m (Vector (MemoryInstance m))
 allocMems mems = Vector.fromList <$> mapM allocMem mems
     where
-        allocMem :: Memory -> IO MemoryInstance
+        allocMem :: Memory -> m (MemoryInstance m)
         allocMem (Memory lim@(Limit from to)) = do
-            mem <- IOVector.replicate (fromIntegral from * pageSize) 0
-            memory <- newIORef mem
+            mem <- MVector.replicate (fromIntegral from * pageSize) 0
+            memory <- newRef mem
             return MemoryInstance {
                 lim,
                 memory
             }
 
-type Initialize = ExceptT String IO
+type Initialize m = ExceptT String m
 
-initialize :: ModuleInstance -> Module -> Store -> Initialize Store
+initialize :: forall m. (MonadRef m, PrimMonad m) => ModuleInstance -> Module -> Store m -> Initialize m (Store m)
 initialize inst Module {elems, datas, start} store = do
     checkedMems <- mapM (checkData store) datas
     checkedTables <- mapM (checkElem store) elems
@@ -491,15 +493,15 @@ initialize inst Module {elems, datas, start} store = do
     case start of
         Just (StartFunction idx) -> do
             let funInst = funcInstances store ! (funcaddrs inst ! fromIntegral idx)
-            mainRes <- liftIO $ eval defaultBudget st funInst []
+            mainRes <- lift $ eval defaultBudget st funInst []
             case mainRes of
                 Just [] -> return st
                 _ -> throwError "Start function terminated with trap"
         Nothing -> return st
     where
-        checkElem :: Store -> ElemSegment -> Initialize (Address, Int, [Address])
+        checkElem :: Store m -> ElemSegment -> Initialize m (Address, Int, [Address])
         checkElem st ElemSegment {tableIndex, offset, funcIndexes} = do
-            VI32 val <- liftIO $ evalConstExpr inst st offset
+            VI32 val <- lift $ evalConstExpr inst st offset
             let from = fromIntegral val
             let funcs = map ((funcaddrs inst !) . fromIntegral) funcIndexes
             let idx = tableaddrs inst ! fromIntegral tableIndex
@@ -509,36 +511,36 @@ initialize inst Module {elems, datas, start} store = do
             Monad.when (last > len) $ throwError "elements segment does not fit"
             return (idx, from, funcs)
 
-        initElem :: Store -> (Address, Int, [Address]) -> Initialize Store
+        initElem :: Store m -> (Address, Int, [Address]) -> Initialize m (Store m)
         initElem st (idx, from, funcs) = do
             let TableInstance lim elems = tableInstances st ! idx
             let table = TableInstance lim (elems // zip [from..] (map Just funcs))
             return st { tableInstances = tableInstances st Vector.// [(idx, table)] }
 
-        checkData :: Store -> DataSegment -> Initialize (Int, IOVector Word8, LBS.ByteString)
+        checkData :: Store m -> DataSegment -> Initialize m (Int, MVector (PrimState m) Word8, LBS.ByteString)
         checkData st DataSegment {memIndex, offset, chunk} = do
-            VI32 val <- liftIO $ evalConstExpr inst st offset
+            VI32 val <- lift $ evalConstExpr inst st offset
             let from = fromIntegral val
             let idx = memaddrs inst ! fromIntegral memIndex
             let last = from + (fromIntegral $ LBS.length chunk)
             let MemoryInstance _ memory = memInstances st ! idx
-            mem <- liftIO $ readIORef memory
-            let len = IOVector.length mem
+            mem <- lift $ readRef memory
+            let len = MVector.length mem
             Monad.when (last > len) $ throwError "data segment does not fit"
             return (from, mem, chunk)
         
-        initData :: (Int, IOVector Word8, LBS.ByteString) -> Initialize ()
+        initData :: (Int, MVector (PrimState m) Word8, LBS.ByteString) -> Initialize m ()
         initData (from, mem, chunk) =
-            mapM_ (\(i,b) -> IOVector.write mem i b) $ zip [from..] $ LBS.unpack chunk
+            mapM_ (\(i,b) -> MVector.write mem i b) $ zip [from..] $ LBS.unpack chunk
 
-instantiate :: Store -> Imports -> Valid.ValidModule -> IO (Either String (ModuleInstance, Store))
+instantiate :: (MonadRef m, PrimMonad m) => Store m -> Imports -> Valid.ValidModule -> m (Either String (ModuleInstance, Store m))
 instantiate st imps mod = runExceptT $ do
     let m = Valid.getModule mod
     inst <- calcInstance st imps m
     let functions = funcInstances st <> (allocFunctions inst $ Struct.functions m)
-    globals <- liftIO $ (globalInstances st <>) <$> (allocAndInitGlobals inst st $ Struct.globals m)
+    globals <- lift $ (globalInstances st <>) <$> (allocAndInitGlobals inst st $ Struct.globals m)
     let tables = tableInstances st <> (allocTables $ Struct.tables m)
-    mems <- liftIO $ (memInstances st <>) <$> (allocMems $ Struct.mems m)
+    mems <- lift $ (memInstances st <>) <$> (allocMems $ Struct.mems m)
     st' <- initialize inst m $ st {
         funcInstances = functions,
         tableInstances = tables,
@@ -562,7 +564,7 @@ data EvalResult =
     | ReturnFn [Value]
     deriving (Show, Eq)
 
-eval :: Natural -> Store -> FunctionInstance -> [Value] -> IO (Maybe [Value])
+eval :: forall m. (MonadRef m, PrimMonad m) => Natural -> Store m -> FunctionInstance m -> [Value] -> m (Maybe [Value])
 eval 0 _ _ _ = return Nothing
 eval budget store FunctionInstance { funcType, moduleInstance, code = Function { localTypes, body} } args = do
     case sequence $ zipWith checkValType (params funcType) args of
@@ -594,7 +596,7 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         initLocal F32 = VF32 0
         initLocal F64 = VF64 0
 
-        go :: EvalCtx -> Expression -> IO EvalResult
+        go :: EvalCtx -> Expression -> m EvalResult
         go ctx [] = return $ Done ctx
         go ctx (instr:rest) = do
             res <- step ctx instr
@@ -602,35 +604,35 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
                 Done ctx' -> go ctx' rest
                 command -> return command
         
-        makeLoadInstr :: (Bits i, Integral i) => EvalCtx -> Natural -> Int -> ([Value] -> i -> EvalResult) -> IO EvalResult
+        makeLoadInstr :: (Bits i, Integral i) => EvalCtx -> Natural -> Int -> ([Value] -> i -> EvalResult) -> m EvalResult
         makeLoadInstr ctx@EvalCtx{ stack = (VI32 v:rest) } offset byteWidth cont = do
             let MemoryInstance { memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
-            memory <- readIORef memoryRef
+            memory <- readRef memoryRef
             let addr = fromIntegral v + fromIntegral offset
             let readByte idx = do
-                    byte <- IOVector.read memory $ addr + idx
+                    byte <- MVector.read memory $ addr + idx
                     return $ fromIntegral byte `shiftL` (idx * 8)
-            if addr + byteWidth > IOVector.length memory
+            if addr + byteWidth > MVector.length memory
             then return Trap
             else cont rest . sum <$> mapM readByte [0..byteWidth-1]
         makeLoadInstr _ _ _ _ = error "Incorrect value on top of stack for memory instruction"
 
-        makeStoreInstr :: (Bits i, Integral i) => EvalCtx -> Natural -> Int -> i -> IO EvalResult
+        makeStoreInstr :: (Bits i, Integral i) => EvalCtx -> Natural -> Int -> i -> m EvalResult
         makeStoreInstr ctx@EvalCtx{ stack = (VI32 va:rest) } offset byteWidth v = do
             let MemoryInstance { memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
-            memory <- readIORef memoryRef
+            memory <- readRef memoryRef
             let addr = fromIntegral $ va + fromIntegral offset
             let writeByte idx = do
                     let byte = fromIntegral $ v `shiftR` (idx * 8) .&. 0xFF
-                    IOVector.write memory (addr + idx) byte
-            if addr + byteWidth > IOVector.length memory
+                    MVector.write memory (addr + idx) byte
+            if addr + byteWidth > MVector.length memory
             then return Trap
             else do
                 mapM_ writeByte [0..byteWidth-1]
                 return $ Done ctx { stack = rest }
         makeStoreInstr _ _ _ _ = error "Incorrect value on top of stack for memory instruction"
 
-        step :: EvalCtx -> Instruction Natural -> IO EvalResult
+        step :: EvalCtx -> Instruction Natural -> m EvalResult
         step _ Unreachable = return Trap
         step ctx Nop = return $ Done ctx
         step ctx (Block resType expr) = do
@@ -721,13 +723,13 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             let globalInst = globalInstances store ! (globaladdrs moduleInstance ! fromIntegral i)
             val <- case globalInst of
                 GIConst _ v -> return v
-                GIMut _ ref -> readIORef ref
+                GIMut _ ref -> readRef ref
             return $ Done ctx { stack = val : stack ctx }
         step ctx@EvalCtx{ stack = (v:rest) } (SetGlobal i) = do
             let globalInst = globalInstances store ! (globaladdrs moduleInstance ! fromIntegral i)
             case globalInst of
                 GIConst _ v -> error "Attempt of mutation of constant global"
-                GIMut _ ref -> writeIORef ref v
+                GIMut _ ref -> writeRef ref v
             return $ Done ctx { stack = rest }
         step ctx (I32Load MemArg { offset }) =
             makeLoadInstr ctx offset 4 $ (\rest val -> Done ctx { stack = VI32 val : rest })
@@ -787,19 +789,19 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             makeStoreInstr ctx { stack = rest } offset 4 v
         step ctx@EvalCtx{ stack = st } CurrentMemory = do
             let MemoryInstance { memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
-            memory <- readIORef memoryRef
-            let size = fromIntegral $ IOVector.length memory `div` pageSize
+            memory <- readRef memoryRef
+            let size = fromIntegral $ MVector.length memory `div` pageSize
             return $ Done ctx { stack = VI32 size : st }
         step ctx@EvalCtx{ stack = (VI32 n:rest) } GrowMemory = do
             let MemoryInstance { lim = limit@(Limit _ maxLen), memory = memoryRef } = memInstances store ! (memaddrs moduleInstance ! 0)
-            memory <- readIORef memoryRef
-            let size = fromIntegral $ IOVector.length memory `quot` pageSize
+            memory <- readRef memoryRef
+            let size = fromIntegral $ MVector.length memory `quot` pageSize
             let growTo = size + fromIntegral n
             result <- (
                     if fromMaybe True ((growTo <=) . fromIntegral <$> maxLen) && growTo <= 0xFFFF
                     then do
-                        mem' <- IOVector.grow memory $ fromIntegral n * pageSize
-                        writeIORef memoryRef mem'
+                        mem' <- MVector.grow memory $ fromIntegral n * pageSize
+                        writeRef memoryRef mem'
                         return size
                     else return $ -1
                 )
@@ -1089,21 +1091,21 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         step EvalCtx{ stack } instr = error $ "Error during evaluation of instruction: " ++ show instr ++ ". Stack " ++ show stack
 eval _ _ HostInstance { funcType, hostCode } args = Just <$> hostCode args
 
-invoke :: Store -> Address -> [Value] -> IO (Maybe [Value])
+invoke :: (MonadRef m, PrimMonad m) => Store m -> Address -> [Value] -> m (Maybe [Value])
 invoke st funcIdx = eval defaultBudget st $ funcInstances st ! funcIdx
 
-invokeExport :: Store -> ModuleInstance -> TL.Text -> [Value] -> IO (Maybe [Value])
+invokeExport :: (MonadRef m, PrimMonad m) => Store m -> ModuleInstance -> TL.Text -> [Value] -> m (Maybe [Value])
 invokeExport st ModuleInstance { exports } name args =
     case Vector.find (\(ExportInstance n _) -> n == name) exports of
         Just (ExportInstance _ (ExternFunction addr)) -> invoke st addr args
         _ -> error $ "Function with name " ++ show name ++ " was not found in module's exports"
 
-getGlobalValueByName :: Store -> ModuleInstance -> TL.Text -> IO Value
+getGlobalValueByName :: (MonadRef m, PrimMonad m) => Store m -> ModuleInstance -> TL.Text -> m Value
 getGlobalValueByName store ModuleInstance { exports } name =
     case Vector.find (\(ExportInstance n _) -> n == name) exports of
         Just (ExportInstance _ (ExternGlobal addr)) ->
             let globalInst = globalInstances store ! addr in
             case globalInst of
                 GIConst _ v -> return v
-                GIMut _ ref -> readIORef ref
+                GIMut _ ref -> readRef ref
         _ -> error $ "Function with name " ++ show name ++ " was not found in module's exports"

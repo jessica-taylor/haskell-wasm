@@ -24,12 +24,18 @@ library:
   - Language.Wasm
   dependencies:
   - array                >= 0.5  && <0.6
+  - cereal               >= 0.5
   - text                 >= 1.1
   - bytestring           >= 0.10
+  - deepseq              >= 1.4
   - mtl                  >= 2.2  && <3.0
   - transformers         >= 0.4  && <0.6
+  - ref-tf               >= 0.4
+  - primitive            >= 0.6
+  - ieee                 >= 0.7
   - containers           >= 0.5  && <0.6
   - utf8-string          >= 1.0
+  - vector               >= 0.12
 
 tests:
   test:

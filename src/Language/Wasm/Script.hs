@@ -31,7 +31,7 @@ import qualified Language.Wasm.Binary as Binary
 type OnAssertFail = String -> Assertion -> IO ()
 
 data ScriptState = ScriptState {
-    store :: Interpreter.Store,
+    store :: Interpreter.Store IO,
     lastModule :: Maybe Interpreter.ModuleInstance,
     modules :: Map.Map TL.Text Interpreter.ModuleInstance,
     moduleRegistery :: Map.Map TL.Text Interpreter.ModuleInstance
