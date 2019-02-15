@@ -493,9 +493,10 @@ initialize inst Module {elems, datas, start} store = do
     case start of
         Just (StartFunction idx) -> do
             let funInst = funcInstances store ! (funcaddrs inst ! fromIntegral idx)
-            mainRes <- lift $ eval defaultBudget st funInst []
+            -- TODO
+            mainRes <- lift $ eval defaultBudget (const 0, 0) 100 st funInst []
             case mainRes of
-                Just [] -> return st
+                Just ([], _) -> return st
                 _ -> throwError "Start function terminated with trap"
         Nothing -> return st
     where
@@ -554,32 +555,34 @@ type Stack = [Value]
 data EvalCtx = EvalCtx {
     locals :: Vector Value,
     labels :: [Label],
-    stack :: Stack
+    stack :: Stack,
+    stepBudget :: Natural
 } deriving (Show, Eq)
 
 data EvalResult =
     Done EvalCtx
     | Break Int [Value] EvalCtx
     | Trap
-    | ReturnFn [Value]
+    | ReturnFn [Value] Natural
     deriving (Show, Eq)
 
-eval :: forall m. (MonadRef m, PrimMonad m) => Natural -> Store m -> FunctionInstance m -> [Value] -> m (Maybe [Value])
-eval 0 _ _ _ = return Nothing
-eval budget store FunctionInstance { funcType, moduleInstance, code = Function { localTypes, body} } args = do
+eval :: forall m. (MonadRef m, PrimMonad m) => Natural -> (Instruction Natural -> Natural, Natural) -> Natural -> Store m -> FunctionInstance m -> [Value] -> m (Maybe ([Value], Natural))
+eval 0 _ _ _ _ _ = return Nothing
+eval budget (instrCost, memCost) sBudget store FunctionInstance { funcType, moduleInstance, code = Function { localTypes, body} } args = do
     case sequence $ zipWith checkValType (params funcType) args of
         Just checkedArgs -> do
             let initialContext = EvalCtx {
                     locals = Vector.fromList $ checkedArgs ++ map initLocal localTypes,
                     labels = [Label $ results funcType],
-                    stack = []
+                    stack = [],
+                    stepBudget = sBudget
                 }
             res <- go initialContext body
             case res of
-                Done ctx -> return $ Just $ reverse $ stack ctx
-                ReturnFn r -> return $ Just r
-                Break 0 r _ -> return $ Just $ reverse r
-                Break _ _ _ -> error "Break is out of range"
+                Done ctx -> return $ Just (reverse $ stack ctx, stepBudget ctx)
+                ReturnFn r sBudget' -> return $ Just (r, sBudget')
+                Break 0 r ctx -> return $ Just (reverse r, stepBudget ctx)
+                Break _ _ ctx -> error "Break is out of range"
                 Trap -> return Nothing
         Nothing -> return Nothing
     where
@@ -599,10 +602,17 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         go :: EvalCtx -> Expression -> m EvalResult
         go ctx [] = return $ Done ctx
         go ctx (instr:rest) = do
-            res <- step ctx instr
-            case res of
-                Done ctx' -> go ctx' rest
-                command -> return command
+            let costForMem = case instr of
+                  GrowMemory -> case stack ctx of
+                    VI32 n:rest -> fromIntegral n * memCost
+                    _ -> error "Invalid context for GrowMemory"
+                  _ -> 0
+            let cost = instrCost instr + costForMem
+            if cost > stepBudget ctx then return Trap else do
+              res <- step (ctx { stepBudget = stepBudget ctx - cost }) instr
+              case res of
+                  Done ctx' -> go ctx' rest
+                  command -> return command
         
         makeLoadInstr :: (Bits i, Integral i) => EvalCtx -> Natural -> Int -> ([Value] -> i -> EvalResult) -> m EvalResult
         makeLoadInstr ctx@EvalCtx{ stack = (VI32 v:rest) } offset byteWidth cont = do
@@ -671,10 +681,10 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             let idx = fromIntegral v in
             let lbl = fromIntegral $ if idx < length labels then labels !! idx else label in
             step ctx { stack = rest } (Br lbl)
-        step EvalCtx{ stack } Return =
+        step ctx@EvalCtx{ stack } Return =
             let resType = results funcType in
             case sequence $ zipWith checkValType resType $ take (length resType) stack of
-                Just result -> return $ ReturnFn $ reverse result
+                Just result -> return $ ReturnFn (reverse result) (stepBudget ctx)
                 Nothing -> return Trap
         step ctx (Call fun) = do
             let funInst = funcInstances store ! (funcaddrs moduleInstance ! fromIntegral fun)
@@ -682,9 +692,9 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
             let args = params ft
             case sequence $ zipWith checkValType args $ reverse $ take (length args) $ stack ctx of
                 Just params -> do
-                    res <- eval (budget - 1) store funInst params
+                    res <- eval (budget - 1) (instrCost, memCost) (stepBudget ctx) store funInst params
                     case res of
-                        Just res -> return $ Done ctx { stack = reverse res ++ (drop (length args) $ stack ctx) }
+                        Just (res, sBudget') -> return $ Done ctx { stack = reverse res ++ (drop (length args) $ stack ctx), stepBudget = sBudget' }
                         Nothing -> return Trap
                 Nothing -> return Trap
         step ctx@EvalCtx{ stack = (VI32 v): rest } (CallIndirect typeIdx) = do
@@ -701,9 +711,9 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
                     return (funcInst, params)
             case checks of
                 Just (funcInst, params) -> do
-                    res <- eval (budget - 1) store funcInst params
+                    res <- eval (budget - 1) (instrCost, memCost) (stepBudget ctx) store funcInst params
                     case res of
-                        Just res -> return $ Done ctx { stack = reverse res ++ (drop (length params) rest) }
+                        Just (res, sBudget') -> return $ Done ctx { stack = reverse res ++ (drop (length params) rest), stepBudget = sBudget' }
                         Nothing -> return Trap
                 Nothing -> return Trap
         step ctx@EvalCtx{ stack = (_:rest) } Drop = return $ Done ctx { stack = rest }
@@ -1089,10 +1099,11 @@ eval budget store FunctionInstance { funcType, moduleInstance, code = Function {
         step ctx@EvalCtx{ stack = (VI64 v:rest) } (FReinterpretI BS64) =
             return $ Done ctx { stack = VF64 (wordToDouble v) : rest }
         step EvalCtx{ stack } instr = error $ "Error during evaluation of instruction: " ++ show instr ++ ". Stack " ++ show stack
-eval _ _ HostInstance { funcType, hostCode } args = Just <$> hostCode args
+eval _ _ sBudget _ HostInstance { funcType, hostCode } args = (\x -> Just (x, sBudget)) <$> hostCode args
 
+-- TODO
 invoke :: (MonadRef m, PrimMonad m) => Store m -> Address -> [Value] -> m (Maybe [Value])
-invoke st funcIdx = eval defaultBudget st $ funcInstances st ! funcIdx
+invoke st funcIdx args = fmap fst <$> (eval defaultBudget (const 0, 0) 100 st $ funcInstances st ! funcIdx) args
 
 invokeExport :: (MonadRef m, PrimMonad m) => Store m -> ModuleInstance -> TL.Text -> [Value] -> m (Maybe [Value])
 invokeExport st ModuleInstance { exports } name args =
